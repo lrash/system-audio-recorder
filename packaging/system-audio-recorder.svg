@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#30303d"/>
+      <stop offset="1" stop-color="#14141a"/>
+    </linearGradient>
+  </defs>
+
+  <!-- dark rounded tile -->
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="url(#bg)"/>
+  <rect x="8.5" y="8.5" width="239" height="239" rx="53.5" fill="none"
+        stroke="#ffffff" stroke-opacity="0.12" stroke-width="1"/>
+
+  <!-- beamed eighth notes -->
+  <g fill="#f2f2f7">
+    <path d="M102 66 L188 44 L188 72 L102 94 Z"/>
+    <rect x="94" y="66" width="11" height="100" rx="5.5"/>
+    <rect x="177" y="44" width="11" height="100" rx="5.5"/>
+    <ellipse cx="80" cy="170" rx="27" ry="20.5" transform="rotate(-20 80 170)"/>
+    <ellipse cx="163" cy="148" rx="27" ry="20.5" transform="rotate(-20 163 148)"/>
+  </g>
+
+  <!-- record dot, ringed so it reads against the notes -->
+  <circle cx="198" cy="194" r="30" fill="#14141a"/>
+  <circle cx="198" cy="194" r="24" fill="#e4483b"/>
+</svg>

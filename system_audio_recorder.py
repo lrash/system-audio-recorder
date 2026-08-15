@@ -932,6 +932,12 @@ class RecorderWindow(Gtk.Window):
 # Entry point
 # -----------------------------------------------------------------------------
 def main():
+    # Match the .desktop file basename so the desktop shell can tie the
+    # running window back to its launcher -- and therefore its icon.
+    # Without this the app id would come from argv[0].
+    GLib.set_prgname("system-audio-recorder")
+    GLib.set_application_name(APP_TITLE)
+
     Gst.init(None)
 
     required = [CAPTURE_ELEMENT, "audioconvert", "audioresample", "wavenc", "filesink"]

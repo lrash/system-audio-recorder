@@ -56,6 +56,17 @@ well past that.
 python3 system_audio_recorder.py
 ```
 
+### Add it to your applications menu (Linux)
+
+```bash
+./packaging/install-desktop-entry.sh
+```
+
+Puts "System Audio Recorder" in the applications menu with a music icon, so
+you can launch it without a terminal. It writes a `.desktop` entry and icon
+under `~/.local/share` — no root required — using this checkout's path, so it
+keeps working wherever the repo lives. `--uninstall` removes both.
+
 On Windows, from the UCRT64 shell, use `python system_audio_recorder.py` — or
 `pythonw system_audio_recorder.py` to launch without a console window.
 
