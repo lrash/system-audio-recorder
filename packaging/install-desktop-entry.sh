@@ -53,6 +53,11 @@ Keywords=record;audio;sound;music;loopback;capture;monitor;stream;
 StartupNotify=true
 StartupWMClass=$APP_ID
 X-GNOME-UsesNotifications=false
+Actions=About;
+
+[Desktop Action About]
+Name=About / version
+Exec=python3 $REPO/system_audio_recorder.py --about-dialog
 DESKTOP
 chmod 644 "$DESKTOP_FILE"
 

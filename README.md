@@ -149,6 +149,23 @@ the script.
 `ref_docs/WINDOWS-PORT-PLAN.md` documents the Windows port design, the
 approaches considered, remaining risks, and the on-hardware test matrix.
 
+## Checking version, author and copyright
+
+```bash
+python3 system_audio_recorder.py --about
+```
+
+Prints the author, copyright, source, signing key and the capture device in
+use. `--version` gives just the version; `--help` lists the options.
+
+In the GUI, click **About** at the bottom-right of the window. You can also
+right-click the launcher in the applications menu and choose **About /
+version**.
+
+Note that Linux does not embed publisher details inside files the way Windows
+`.exe` files do, so Files' Properties dialog shows only size and permissions —
+the commands above are the equivalent.
+
 ## Author & integrity
 
 Created by **lonestarparrot** — <lonestarparrot@gmail.com>

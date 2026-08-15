@@ -80,8 +80,12 @@ __author__ = "lonestarparrot"
 __email__ = "lonestarparrot@gmail.com"
 __copyright__ = "Copyright (c) 2026 lonestarparrot"
 __version__ = "0.3.0"
+__url__ = "https://github.com/lrash/system-audio-recorder"
+__signing_key__ = "53CAF98A8019832F911E3BA653D4586CB4F47C1D"
 
 APP_TITLE = "System Audio Recorder"
+# Reverse-DNS id shared by the .desktop file, the icon and the Wayland app id.
+APP_ID = "io.github.lrash.SystemAudioRecorder"
 
 WINDOWS = sys.platform == "win32"
 
@@ -375,6 +379,57 @@ def swap_extension(path, new_ext):
     if ext.lower() in KNOWN_EXTENSIONS:
         return root + new_ext
     return path + new_ext
+
+
+# -----------------------------------------------------------------------------
+# Identity / about
+# -----------------------------------------------------------------------------
+def about_lines():
+    """Author and build details, shared by --about and the About dialog."""
+    return [
+        ("Application", "{0} {1}".format(APP_TITLE, __version__)),
+        ("Author", "{0} <{1}>".format(__author__, __email__)),
+        ("Copyright", __copyright__),
+        ("Source", __url__),
+        ("App ID", APP_ID),
+        ("Signing key", __signing_key__),
+        ("Platform", "Windows (WASAPI loopback)" if WINDOWS else "Linux (PulseAudio / PipeWire)"),
+        ("Capture", SOURCE_DESCRIPTION),
+        ("Device", MONITOR or "(system default)"),
+    ]
+
+
+def about_text():
+    """The same details as a plain block, for stdout."""
+    width = max(len(label) for label, _ in about_lines())
+    return "\n".join(
+        "{0:<{1}} : {2}".format(label, width, value) for label, value in about_lines()
+    )
+
+
+def show_about_dialog(parent=None):
+    """GTK About box -- the clickable equivalent of `--about`."""
+    dialog = Gtk.AboutDialog(transient_for=parent, modal=parent is not None)
+    dialog.set_program_name(APP_TITLE)
+    dialog.set_version(__version__)
+    dialog.set_comments(
+        "Records system audio output -- what you hear -- to WAV or Opus."
+    )
+    dialog.set_copyright(__copyright__)
+    dialog.set_authors(["{0} <{1}>".format(__author__, __email__)])
+    dialog.set_website(__url__)
+    dialog.set_website_label("Source on GitHub")
+    dialog.set_logo_icon_name(APP_ID)
+    dialog.set_license_type(Gtk.License.CUSTOM)
+    dialog.set_license(
+        "{0}\nAll rights reserved.\n\n"
+        "Releases are signed with OpenPGP key\n{1}\n\n"
+        "Verify a copy with:\n"
+        "    gpg --verify SHA256SUMS.asc SHA256SUMS\n"
+        "    sha256sum -c SHA256SUMS".format(__copyright__, __signing_key__)
+    )
+    dialog.run()
+    dialog.destroy()
 
 
 # -----------------------------------------------------------------------------
@@ -725,12 +780,22 @@ class RecorderWindow(Gtk.Window):
         self.expander.add(adv)
         outer.pack_start(self.expander, False, False, 0)
 
-        # Bottom: status label
+        # Bottom: status label, with About tucked on the right
+        row_status = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.label_status = Gtk.Label(label="Idle")
         self.label_status.set_xalign(0.0)
         self.label_status.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
         self.label_status.set_selectable(True)
-        outer.pack_start(self.label_status, False, False, 0)
+        row_status.pack_start(self.label_status, True, True, 0)
+
+        self.button_about = Gtk.Button(label="About")
+        self.button_about.set_relief(Gtk.ReliefStyle.NONE)
+        self.button_about.set_tooltip_text(
+            "Version, author and copyright details"
+        )
+        self.button_about.connect("clicked", self.on_about_clicked)
+        row_status.pack_start(self.button_about, False, False, 0)
+        outer.pack_start(row_status, False, False, 0)
 
         self.connect("delete-event", self.on_delete_event)
 
@@ -850,6 +915,9 @@ class RecorderWindow(Gtk.Window):
         else:
             self.stop_recording()
 
+    def on_about_clicked(self, _button):
+        show_about_dialog(self)
+
     def on_delete_event(self, *_args):
         self.shutdown()
         Gtk.main_quit()
@@ -943,14 +1011,50 @@ class RecorderWindow(Gtk.Window):
 # -----------------------------------------------------------------------------
 # Entry point
 # -----------------------------------------------------------------------------
+USAGE = """Usage: system_audio_recorder.py [OPTION]
+
+Records system audio output (what you hear) to WAV or Opus.
+With no options, opens the recorder window.
+
+  -V, --version    print the version and exit
+      --about      print author, copyright and capture details, then exit
+      --about-dialog
+                   show the About window and exit
+  -h, --help       show this message and exit
+"""
+
+
 def main():
+    argv = sys.argv[1:]
+
+    # Text-mode queries answer before any GUI or GStreamer setup happens.
+    if "-h" in argv or "--help" in argv:
+        sys.stdout.write(USAGE)
+        return 0
+    if "-V" in argv or "--version" in argv:
+        print("{0} {1}".format(APP_TITLE, __version__))
+        return 0
+    if "--about" in argv:
+        print(about_text())
+        return 0
+
+    unknown = [a for a in argv if a.startswith("-") and a != "--about-dialog"]
+    if unknown:
+        sys.stderr.write("Unknown option: {0}\n\n".format(unknown[0]))
+        sys.stderr.write(USAGE)
+        return 2
+
     # Match the .desktop file basename so the desktop shell can tie the
     # running window back to its launcher -- and therefore its icon.
     # Without this the app id would come from argv[0].
-    GLib.set_prgname("io.github.lrash.SystemAudioRecorder")
+    GLib.set_prgname(APP_ID)
     GLib.set_application_name(APP_TITLE)
 
     Gst.init(None)
+
+    if "--about-dialog" in argv:
+        show_about_dialog()
+        return 0
 
     required = [CAPTURE_ELEMENT, "audioconvert", "audioresample", "wavenc", "filesink"]
     if WINDOWS:
