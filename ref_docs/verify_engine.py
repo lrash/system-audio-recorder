@@ -134,17 +134,24 @@ def test_start_errors(app, workdir):
         check("error carries a title", bool(error.title), error.title)
     check("engine still idle after failed start", recorder.state == app.Recorder.IDLE)
 
-    readonly = os.path.join(workdir, "readonly")
-    os.mkdir(readonly)
-    os.chmod(readonly, 0o500)
-    try:
-        recorder.start("wav", app.MONITOR, os.path.join(readonly, "x.wav"))
-        check("unwritable folder raises", False, "no exception raised")
-    except app.RecorderError:
-        check("unwritable folder raises RecorderError", True)
-    finally:
-        os.chmod(readonly, 0o700)
-    check("engine idle after second failed start", recorder.state == app.Recorder.IDLE)
+    # os.chmod cannot make a *directory* unwritable on Windows -- it only
+    # toggles the read-only flag on files -- so os.access(..., W_OK) stays
+    # True there and this check would report a failure that is not real.
+    if sys.platform == "win32":
+        print("  SKIP unwritable-folder check (chmod is a no-op on Windows)")
+    else:
+        readonly = os.path.join(workdir, "readonly")
+        os.mkdir(readonly)
+        os.chmod(readonly, 0o500)
+        try:
+            recorder.start("wav", app.MONITOR, os.path.join(readonly, "x.wav"))
+            check("unwritable folder raises", False, "no exception raised")
+        except app.RecorderError:
+            check("unwritable folder raises RecorderError", True)
+        finally:
+            os.chmod(readonly, 0o700)
+        check("engine idle after second failed start",
+              recorder.state == app.Recorder.IDLE)
 
 
 def test_shutdown_midway(app, workdir):

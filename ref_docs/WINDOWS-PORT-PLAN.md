@@ -130,9 +130,25 @@ Install MSYS2 from https://www.msys2.org/, then in the **UCRT64** shell:
 pacman -S --needed git mingw-w64-ucrt-x86_64-python mingw-w64-ucrt-x86_64-python-gobject mingw-w64-ucrt-x86_64-gtk3 mingw-w64-ucrt-x86_64-gstreamer mingw-w64-ucrt-x86_64-gst-plugins-base mingw-w64-ucrt-x86_64-gst-plugins-good mingw-w64-ucrt-x86_64-gst-plugins-bad
 ```
 
-```bash
-git clone https://github.com/lrash/system-audio-recorder.git && cd system-audio-recorder && git checkout windows-port
+Get the code. The repo is **private**, so the clone needs to authenticate as
+the `lrash` account. The path of least resistance is to clone with **Git for
+Windows** (its credential manager can log in through the browser), into a
+normal Windows folder, and only then work on it from the MSYS2 shell — MSYS2's
+own `git` has no credential helper and will ask for a password that a GitHub
+account no longer accepts. From PowerShell or Command Prompt:
+
+```powershell
+git clone https://github.com/lrash/system-audio-recorder.git %USERPROFILE%\system-audio-recorder
 ```
+
+Then in the MSYS2 **UCRT64** shell, that folder is visible under `/c/Users/`:
+
+```bash
+cd /c/Users/$USERNAME/system-audio-recorder
+```
+
+Everything needed is on `main` — no branch switch. Confirm with
+`git log --oneline -1`, which should show the merge commit.
 
 Confirm the loopback element exists and the plugin version is new enough:
 

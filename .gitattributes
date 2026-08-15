@@ -1,0 +1,6 @@
+# Keep line endings stable across the Linux/Windows split.
+# Python and Markdown are checked out LF everywhere; Git for Windows would
+# otherwise convert to CRLF on checkout depending on core.autocrlf.
+*.py   text eol=lf
+*.md   text eol=lf
+*      text=auto

@@ -816,7 +816,7 @@ class RecorderWindow(Gtk.Window):
         dialog.add_filter(all_filter)
 
         current = self.entry_file.get_text().strip() or default_filename(fmt["ext"])
-        folder = os.path.dirname(current) or os.path.expanduser("~")
+        folder = os.path.dirname(current) or home_directory()
         if os.path.isdir(folder):
             dialog.set_current_folder(folder)
         dialog.set_current_name(os.path.basename(current))
