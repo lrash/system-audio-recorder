@@ -8,6 +8,13 @@ Runs on **Linux** (PulseAudio or PipeWire) and **Windows 10/11** (WASAPI
 loopback). Pure GStreamer + PyGObject: no FFmpeg, no subprocess recording, a
 single Python file with no pip dependencies.
 
+## Platform status
+
+| Platform | Status |
+|---|---|
+| Linux — PulseAudio / PipeWire | **Verified.** Both automated suites pass on Ubuntu with PipeWire. |
+| Windows 10/11 — WASAPI loopback | **Implemented, not yet run on Windows hardware.** The code path, install docs and test kit are complete, and everything testable from Linux passes — but `wasapi2src` itself has never executed. Treat as beta until the Phase 4 matrix in [`ref_docs/WINDOWS-PORT-PLAN.md`](ref_docs/WINDOWS-PORT-PLAN.md) is run. |
+
 ## Features
 
 - Records the system **output** (not the microphone)
