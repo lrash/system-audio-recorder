@@ -148,3 +148,30 @@ the script.
 
 `ref_docs/WINDOWS-PORT-PLAN.md` documents the Windows port design, the
 approaches considered, remaining risks, and the on-hardware test matrix.
+
+## Author & integrity
+
+Created by **lonestarparrot** — <lonestarparrot@gmail.com>
+Copyright (c) 2026 lonestarparrot. All rights reserved.
+
+Releases are signed with OpenPGP key `53CAF98A8019832F911E3BA653D4586CB4F47C1D`
+(short id `53D4586CB4F47C1D`). To check that a copy is authentic and unmodified:
+
+```bash
+gpg --import packaging/lonestarparrot-signing-key.asc
+gpg --verify SHA256SUMS.asc SHA256SUMS && sha256sum -c SHA256SUMS
+```
+
+A good signature plus matching checksums means every file is exactly as
+published. Git tags and commits are signed with the same key, so GitHub shows
+them as **Verified**. Re-sign after changes with
+`./packaging/sign-release.sh`.
+
+Attribution the desktop reads is in
+`packaging/io.github.lrash.SystemAudioRecorder.metainfo.xml` (AppStream), which
+names lonestarparrot as the developer.
+
+> Note on "trust": Linux has no OS-level publisher gate for scripts or desktop
+> launchers, so nothing here suppresses a warning the way a Windows
+> Authenticode certificate does — there is no such warning to suppress. What
+> the signature gives you is verifiable authorship and tamper-evidence.

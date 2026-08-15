@@ -8,6 +8,13 @@
 #    * Linux   - Ubuntu 20.04+ with PulseAudio or PipeWire (pipewire-pulse)
 #    * Windows - Windows 10/11 via WASAPI loopback
 #
+#  Author:    lonestarparrot <lonestarparrot@gmail.com>
+#  Source:    https://github.com/lrash/system-audio-recorder
+#  Copyright (c) 2026 lonestarparrot.  All rights reserved.
+#
+#  Release integrity: signed builds carry a detached OpenPGP signature next
+#  to the file (see SHA256SUMS.asc) made with key 53D4586CB4F47C1D.
+#
 #  Pure GStreamer + PyGObject.  No FFmpeg, no subprocess recording.
 #
 #  On Linux the capture device must be named explicitly, so `pactl` is run ONCE
@@ -68,6 +75,11 @@ gi.require_version("Pango", "1.0")
 
 from gi.repository import GLib, Gst, Gtk, Pango  # noqa: E402  (after require_version)
 
+
+__author__ = "lonestarparrot"
+__email__ = "lonestarparrot@gmail.com"
+__copyright__ = "Copyright (c) 2026 lonestarparrot"
+__version__ = "0.3.0"
 
 APP_TITLE = "System Audio Recorder"
 
@@ -935,7 +947,7 @@ def main():
     # Match the .desktop file basename so the desktop shell can tie the
     # running window back to its launcher -- and therefore its icon.
     # Without this the app id would come from argv[0].
-    GLib.set_prgname("system-audio-recorder")
+    GLib.set_prgname("io.github.lrash.SystemAudioRecorder")
     GLib.set_application_name(APP_TITLE)
 
     Gst.init(None)
