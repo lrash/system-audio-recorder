@@ -4,16 +4,22 @@
 # =============================================================================
 #  System Audio Recorder
 #  ---------------------------------------------------------------------------
-#  Records what you HEAR (the system audio output / loopback "monitor" source)
-#  on Ubuntu 20.04+ running either PulseAudio or PipeWire (pipewire-pulse).
+#  Records what you HEAR (the system audio output loopback) on:
+#    * Linux   - Ubuntu 20.04+ with PulseAudio or PipeWire (pipewire-pulse)
+#    * Windows - Windows 10/11 via WASAPI loopback
 #
 #  Pure GStreamer + PyGObject.  No FFmpeg, no subprocess recording.
-#  `pactl` is used ONCE at startup, only to discover the monitor device name;
-#  on PipeWire boxes without pulseaudio-utils, `pw-dump` is used instead.
+#
+#  On Linux the capture device must be named explicitly, so `pactl` is run ONCE
+#  at startup to discover the monitor source (falling back to `pw-dump` on
+#  PipeWire boxes without pulseaudio-utils).  On Windows `wasapi2src` captures
+#  the default render device on its own, so no discovery step is needed.
 #
 #  ---------------------------------------------------------------------------
 #  HOW TO INSTALL DEPENDENCIES  (run this once, before first launch)
 #  ---------------------------------------------------------------------------
+#
+#  LINUX (Debian/Ubuntu):
 #
 #    sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0 \
 #          gstreamer1.0-plugins-good gstreamer1.0-libav \
@@ -24,13 +30,25 @@
 #    sudo apt install gir1.2-gstreamer-1.0 gstreamer1.0-pulseaudio \
 #          gstreamer1.0-plugins-base pulseaudio-utils
 #
-#  Then run:
+#  Then run:   python3 system_audio_recorder.py
 #
-#    python3 system_audio_recorder.py
+#  WINDOWS (MSYS2 - https://www.msys2.org/), from the UCRT64 shell:
+#
+#    pacman -S --needed mingw-w64-ucrt-x86_64-python \
+#          mingw-w64-ucrt-x86_64-python-gobject \
+#          mingw-w64-ucrt-x86_64-gtk3 \
+#          mingw-w64-ucrt-x86_64-gstreamer \
+#          mingw-w64-ucrt-x86_64-gst-plugins-base \
+#          mingw-w64-ucrt-x86_64-gst-plugins-good \
+#          mingw-w64-ucrt-x86_64-gst-plugins-bad
+#
+#    Then run:   python system_audio_recorder.py
+#    (or `pythonw system_audio_recorder.py` for no console window)
 #
 #  ---------------------------------------------------------------------------
 #  Element origins (for troubleshooting "no element ..." errors):
 #    pulsesrc, wavenc      -> gstreamer1.0-pulseaudio / -plugins-good
+#    wasapi2src (Windows)  -> gst-plugins-bad (GStreamer >= 1.18)
 #    audioconvert, resample-> gstreamer1.0-plugins-base
 #    opusenc               -> gstreamer1.0-plugins-base (>=1.14) or -plugins-bad
 #    oggmux                -> gstreamer1.0-plugins-base
@@ -53,33 +71,63 @@ from gi.repository import GLib, Gst, Gtk, Pango  # noqa: E402  (after require_ve
 
 APP_TITLE = "System Audio Recorder"
 
-# Last-resort device name if `pactl` is unavailable or reports no monitor.
+WINDOWS = sys.platform == "win32"
+
+# Last-resort Linux device name if `pactl`/`pw-dump` report no monitor.
+# Unused on Windows, where the source finds the default render device itself.
 FALLBACK_MONITOR = "alsa_output.pci-0000_00_1f.3.analog-stereo.monitor"
 
-# Formats: key -> (label, file extension, GStreamer pipeline description)
+if WINDOWS:
+    # wasapi2src with loopback=true captures the default *render* endpoint --
+    # i.e. what you hear -- with no device name required.
+    #
+    # `audiorate` is deliberate insurance: WASAPI loopback historically stops
+    # delivering buffers while nothing is playing, which would shorten the
+    # recording rather than record silence.  audiorate fills such gaps to keep
+    # wall-clock and media time in step, and is an inert passthrough when the
+    # source already behaves (which wasapi2src does on current Windows 10/11).
+    SOURCE_DESCRIPTION = "wasapi2src name=src loopback=true ! audiorate"
+    CAPTURE_ELEMENT = "wasapi2src"
+    DEVICE_LIST_HINT = "gst-device-monitor-1.0 Audio/Sink"
+    INSTALL_HINT = (
+        "Install them from the MSYS2 UCRT64 shell with:\n"
+        "    pacman -S --needed mingw-w64-ucrt-x86_64-gstreamer \\\n"
+        "          mingw-w64-ucrt-x86_64-gst-plugins-base \\\n"
+        "          mingw-w64-ucrt-x86_64-gst-plugins-good \\\n"
+        "          mingw-w64-ucrt-x86_64-gst-plugins-bad"
+    )
+else:
+    SOURCE_DESCRIPTION = "pulsesrc name=src"
+    CAPTURE_ELEMENT = "pulsesrc"
+    DEVICE_LIST_HINT = "pactl list short sources | grep monitor"
+    INSTALL_HINT = (
+        "Install them with:\n"
+        "    sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0 \\\n"
+        "          gstreamer1.0-plugins-good gstreamer1.0-libav \\\n"
+        "          gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly"
+    )
+
+# Formats: key -> (label, file extension, encode/mux tail of the pipeline).
+# The capture source is prepended per platform by pipeline_description().
 FORMATS = {
     "wav": {
         "label": "WAV",
         "ext": ".wav",
         "mime_pattern": "*.wav",
-        "description": (
-            "pulsesrc name=src ! "
+        "encoder": (
             "audioconvert ! audioresample ! "
             "audio/x-raw,format=S16LE,rate=44100,channels=2 ! "
-            "wavenc ! "
-            "filesink name=sink"
+            "wavenc"
         ),
     },
     "opus": {
         "label": "Opus",
         "ext": ".opus",
         "mime_pattern": "*.opus",
-        "description": (
-            "pulsesrc name=src ! "
+        "encoder": (
             "audioconvert ! audioresample ! "
             "opusenc bitrate=128000 ! "
-            "oggmux ! "
-            "filesink name=sink"
+            "oggmux"
         ),
     },
 }
@@ -189,15 +237,23 @@ def _pw_default_sink_name(dump):
 
 def detect_monitor():
     """
-    Detect the monitor source of the default output device.
+    Detect the loopback capture device for the default output.
 
-    Tries `pactl` first (PulseAudio, or PipeWire via pipewire-pulse), then
-    falls back to `pw-dump` on PipeWire boxes without pulseaudio-utils —
-    pipewire-pulse exposes each sink's monitor as "<node.name>.monitor".
+    On Windows there is nothing to detect: wasapi2src with loopback=true
+    already follows the default render endpoint, so ("", None) is returned and
+    the source is left on its own default.
+
+    On Linux the device must be named, so this tries `pactl` first (PulseAudio,
+    or PipeWire via pipewire-pulse), then falls back to `pw-dump` on PipeWire
+    boxes without pulseaudio-utils — pipewire-pulse exposes each sink's monitor
+    as "<node.name>.monitor".
 
     Returns (device_name, warning_or_None).  The warning is a human-readable
     string when detection was not reliable and the user should double-check.
     """
+    if WINDOWS:
+        return "", None
+
     monitors = list_monitor_sources()
     sink = default_sink_name()
 
@@ -237,7 +293,9 @@ MONITOR, MONITOR_WARNING = detect_monitor()
 # -----------------------------------------------------------------------------
 def pipeline_description(fmt_key):
     """Return the gst-launch style description for the given format key."""
-    return FORMATS[fmt_key]["description"]
+    return "{0} ! {1} ! filesink name=sink".format(
+        SOURCE_DESCRIPTION, FORMATS[fmt_key]["encoder"]
+    )
 
 
 def build_pipeline(fmt_key, device, location):
@@ -247,6 +305,10 @@ def build_pipeline(fmt_key, device, location):
     The element chain is parsed from the description above; `device` and
     `location` are applied as properties afterwards so that names containing
     spaces, quotes or other shell-significant characters are handled safely.
+
+    `device` may be None or empty, which leaves the source on its own default.
+    That is the normal case on Windows (wasapi2src follows the default render
+    endpoint) and the last-resort case on Linux.
 
     Raises GLib.Error if the description cannot be parsed (missing plugin, ...)
     or RuntimeError if the named elements are unexpectedly absent.
@@ -258,13 +320,15 @@ def build_pipeline(fmt_key, device, location):
     if src is None or sink is None:
         raise RuntimeError("Internal error: pipeline is missing 'src' or 'sink'.")
 
-    src.set_property("device", device)
-    # Keep the ring buffer modest so stopping is snappy.
-    try:
-        src.set_property("buffer-time", 200000)   # 200 ms
-        src.set_property("latency-time", 20000)   # 20 ms
-    except TypeError:
-        pass  # Older pulsesrc without these properties: harmless.
+    if device:
+        src.set_property("device", device)
+    # Keep the ring buffer modest so stopping is snappy.  Both properties are
+    # pulsesrc-specific; wasapi2src manages its own buffering.
+    for prop, value in (("buffer-time", 200000), ("latency-time", 20000)):
+        try:
+            src.set_property(prop, value)
+        except TypeError:
+            pass  # Source without these properties (wasapi2src, older pulsesrc).
 
     sink.set_property("location", location)
     sink.set_property("sync", False)
@@ -272,10 +336,25 @@ def build_pipeline(fmt_key, device, location):
     return pipeline
 
 
+def home_directory():
+    """
+    The user's home folder.
+
+    On Windows under MSYS2, os.path.expanduser("~") resolves to the MSYS2 home
+    (C:\\msys64\\home\\<user>) rather than the Windows profile, which is not
+    where anyone expects their recordings.  Prefer USERPROFILE there.
+    """
+    if WINDOWS:
+        profile = os.environ.get("USERPROFILE")
+        if profile and os.path.isdir(profile):
+            return profile
+    return os.path.expanduser("~")
+
+
 def default_filename(ext):
-    """~/sysrec-YYYYMMDD-HHMMSS.<ext>"""
+    """<home>/sysrec-YYYYMMDD-HHMMSS.<ext>"""
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    return os.path.join(os.path.expanduser("~"), "sysrec-{0}{1}".format(stamp, ext))
+    return os.path.join(home_directory(), "sysrec-{0}{1}".format(stamp, ext))
 
 
 def swap_extension(path, new_ext):
@@ -284,6 +363,253 @@ def swap_extension(path, new_ext):
     if ext.lower() in KNOWN_EXTENSIONS:
         return root + new_ext
     return path + new_ext
+
+
+# -----------------------------------------------------------------------------
+# Recording engine
+# -----------------------------------------------------------------------------
+class RecorderError(Exception):
+    """A start-up failure carrying a title and a human-readable explanation."""
+
+    def __init__(self, title, message):
+        Exception.__init__(self, "{0}: {1}".format(title, message))
+        self.title = title
+        self.message = message
+
+
+class Recorder(object):
+    """
+    The recording engine: pipeline lifecycle, state machine and timers.
+
+    Deliberately free of any GUI dependency -- it uses GLib (timers, main-loop
+    dispatch) but never Gtk, and it neither reads nor writes a widget.  A view
+    drives it through start()/stop() and learns about progress through the
+    callbacks handed to __init__, so the same engine can back a window, a test
+    harness or a headless caller.
+
+    State machine:  idle -> recording -> stopping -> idle
+
+    Callbacks (all optional):
+        on_state(state)                  state changed; see the constants below
+        on_tick(elapsed_seconds)         once a second while recording
+        on_error(title, message)         asynchronous failure; state is idle
+        on_finished(path, size, forced)  file closed; `forced` means the EOS
+                                         timed out and the pipeline was cut
+    """
+
+    IDLE = "idle"
+    RECORDING = "recording"
+    STOPPING = "stopping"
+
+    def __init__(self, on_state=None, on_tick=None, on_error=None, on_finished=None):
+        self._on_state = on_state or (lambda state: None)
+        self._on_tick = on_tick or (lambda elapsed: None)
+        self._on_error = on_error or (lambda title, message: None)
+        self._on_finished = on_finished or (lambda path, size, forced: None)
+
+        # Public, and the source of truth: no widget holds this state.
+        self.state = self.IDLE
+        self.path = None
+        self.format_key = None
+        self.device = None
+        self.elapsed = 0
+
+        self._pipeline = None
+        self._bus = None
+        self._tick_id = 0
+        self._duration_id = 0
+        self._eos_timeout_id = 0
+
+    @property
+    def is_active(self):
+        """True while recording or finalising."""
+        return self.state != self.IDLE
+
+    # -- control ------------------------------------------------------------
+    def start(self, fmt_key, device, path, limit_seconds=0):
+        """
+        Begin recording `fmt_key` from `device` into `path`.
+
+        `limit_seconds` > 0 stops automatically after that long.  Raises
+        RecorderError when recording cannot begin; the caller decides how to
+        present it.
+        """
+        if self.is_active:
+            return
+
+        directory = os.path.dirname(path)
+        if not os.path.isdir(directory):
+            raise RecorderError(
+                "Cannot start recording", "Folder does not exist:\n" + directory
+            )
+        if not os.access(directory, os.W_OK):
+            raise RecorderError(
+                "Cannot start recording", "Folder is not writable:\n" + directory
+            )
+
+        try:
+            self._pipeline = build_pipeline(fmt_key, device, path)
+        except GLib.Error as error:
+            self._pipeline = None
+            raise RecorderError(
+                "Could not build the GStreamer pipeline",
+                "{0}\n\nPipeline:\n{1}\n\n"
+                "A required plugin is probably missing.\n\n{2}".format(
+                    error.message, pipeline_description(fmt_key), INSTALL_HINT
+                ),
+            )
+        except RuntimeError as error:
+            self._pipeline = None
+            raise RecorderError("Could not build the GStreamer pipeline", str(error))
+
+        self._bus = self._pipeline.get_bus()
+        self._bus.add_signal_watch()
+        self._bus.connect("message::error", self._handle_bus_error)
+        self._bus.connect("message::warning", self._handle_bus_warning)
+        self._bus.connect("message::eos", self._handle_bus_eos)
+
+        if self._pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            self._teardown()
+            raise RecorderError(
+                "Could not start recording",
+                "GStreamer refused to start the pipeline.\n\n"
+                + (
+                    "Capture device: {0}\n\n".format(device)
+                    if device
+                    else "Capture device: (system default)\n\n"
+                )
+                + "List the available devices with:\n    " + DEVICE_LIST_HINT,
+            )
+
+        self.path = path
+        self.format_key = fmt_key
+        self.device = device
+        self.elapsed = 0
+        self._set_state(self.RECORDING)
+
+        self._tick_id = GLib.timeout_add_seconds(1, self._tick)
+        if limit_seconds > 0:
+            self._duration_id = GLib.timeout_add_seconds(
+                limit_seconds, self._duration_reached
+            )
+
+    def stop(self):
+        """
+        Ask for a clean stop.
+
+        EOS is sent so wavenc/oggmux flush their headers and the file is
+        valid; the state becomes "stopping" until that completes or times out.
+        """
+        if self.state != self.RECORDING:
+            return
+        self._cancel("_tick_id", "_duration_id")
+        self._set_state(self.STOPPING)
+        self._pipeline.send_event(Gst.Event.new_eos())
+        self._eos_timeout_id = GLib.timeout_add(EOS_TIMEOUT_MS, self._eos_timed_out)
+
+    def abort(self):
+        """Drop the pipeline and return to idle without finalising the file."""
+        self._cancel("_tick_id", "_duration_id", "_eos_timeout_id")
+        self._teardown()
+        self.elapsed = 0
+        self._set_state(self.IDLE)
+
+    def shutdown(self):
+        """
+        Best-effort synchronous finalisation, for application exit.
+
+        Unlike stop() this does not wait on the main loop -- which is about to
+        stop turning -- so it pumps the bus directly.  No callbacks are fired.
+        """
+        self._cancel("_tick_id", "_duration_id", "_eos_timeout_id")
+        if self._pipeline is not None and self.is_active:
+            # Flush the encoder/muxer so a file closed by window-close plays.
+            self._pipeline.send_event(Gst.Event.new_eos())
+            self._pipeline.get_bus().timed_pop_filtered(
+                2 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR
+            )
+        self.state = self.IDLE  # set directly: no observer left to notify
+        self._teardown()
+
+    # -- internals ----------------------------------------------------------
+    def _set_state(self, state):
+        self.state = state
+        self._on_state(state)
+
+    def _cancel(self, *names):
+        for name in names:
+            source_id = getattr(self, name)
+            if source_id:
+                GLib.source_remove(source_id)
+                setattr(self, name, 0)
+
+    def _teardown(self):
+        if self._bus is not None:
+            try:
+                self._bus.remove_signal_watch()
+            except Exception:
+                pass
+            self._bus = None
+        if self._pipeline is not None:
+            self._pipeline.set_state(Gst.State.NULL)
+            self._pipeline = None
+
+    def _finish(self, forced):
+        path = self.path
+        self._cancel("_tick_id", "_duration_id", "_eos_timeout_id")
+        self._teardown()
+        self.elapsed = 0
+        self._set_state(self.IDLE)
+        size = os.path.getsize(path) if path and os.path.exists(path) else 0
+        self._on_finished(path, size, forced)
+
+    def _tick(self):
+        if self.state != self.RECORDING:
+            self._tick_id = 0
+            return False
+        self.elapsed += 1
+        self._on_tick(self.elapsed)
+        return True
+
+    def _duration_reached(self):
+        self._duration_id = 0
+        self.stop()
+        return False
+
+    def _eos_timed_out(self):
+        self._eos_timeout_id = 0
+        if self.state == self.STOPPING:
+            self._finish(forced=True)
+        return False
+
+    # The bus watch dispatches on the main loop; these handlers tear the watch
+    # itself down, so the real work is deferred to an idle callback.
+    def _handle_bus_eos(self, _bus, _message):
+        self._cancel("_eos_timeout_id")
+        if self.is_active:
+            GLib.idle_add(self._deferred_finish)
+
+    def _deferred_finish(self):
+        if self.is_active:
+            self._finish(forced=False)
+        return False
+
+    def _handle_bus_warning(self, _bus, message):
+        warning, _debug = message.parse_warning()
+        sys.stderr.write("[gst warning] {0}\n".format(warning.message))
+
+    def _handle_bus_error(self, _bus, message):
+        error, debug = message.parse_error()
+        details = error.message
+        if debug:
+            details += "\n\n" + debug
+        GLib.idle_add(self._deferred_error, details)
+
+    def _deferred_error(self, details):
+        if self._pipeline is not None:
+            self.abort()
+            self._on_error("Recording error", details)
+        return False
 
 
 # -----------------------------------------------------------------------------
@@ -300,16 +626,15 @@ class RecorderWindow(Gtk.Window):
         self.set_resizable(True)
 
         # --- state -----------------------------------------------------------
-        self.pipeline = None
-        self.bus = None
-        self.recording = False
-        self.stopping = False
+        # Recording state lives in the engine; only view concerns are kept here.
         self.auto_filename = True          # filename still the generated default?
         self.updating_toggle = False       # guard against signal recursion
-        self.elapsed = 0
-        self.tick_id = 0
-        self.eos_timeout_id = 0
-        self.duration_id = 0
+        self.recorder = Recorder(
+            on_state=self.on_recorder_state,
+            on_tick=self.on_recorder_tick,
+            on_error=self.on_recorder_error,
+            on_finished=self.on_recorder_finished,
+        )
 
         # --- layout ----------------------------------------------------------
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -357,10 +682,18 @@ class RecorderWindow(Gtk.Window):
         row_device.pack_start(Gtk.Label(label="Device:"), False, False, 0)
         self.entry_device = Gtk.Entry()
         self.entry_device.set_text(MONITOR)
-        self.entry_device.set_tooltip_text(
-            "PulseAudio/PipeWire monitor source.\n"
-            "List them with:  pactl list short sources | grep monitor"
-        )
+        if WINDOWS:
+            self.entry_device.set_placeholder_text("(default output device)")
+            self.entry_device.set_tooltip_text(
+                "Leave empty to follow the default output device.\n"
+                "To capture a specific one, paste its WASAPI device id.\n"
+                "List them with:  gst-device-monitor-1.0 Audio/Sink"
+            )
+        else:
+            self.entry_device.set_tooltip_text(
+                "PulseAudio/PipeWire monitor source.\n"
+                "List them with:  pactl list short sources | grep monitor"
+            )
         row_device.pack_start(self.entry_device, True, True, 0)
         adv.pack_start(row_device, False, False, 0)
 
@@ -445,7 +778,7 @@ class RecorderWindow(Gtk.Window):
             self.auto_filename = False
 
     def on_format_toggled(self, button, key):
-        if not button.get_active() or self.recording:
+        if not button.get_active() or self.recorder.is_active:
             return
         ext = FORMATS[key]["ext"]
         current = self.entry_file.get_text().strip()
@@ -510,9 +843,9 @@ class RecorderWindow(Gtk.Window):
         Gtk.main_quit()
         return False
 
-    # -- recording ----------------------------------------------------------
+    # -- recording (thin: the engine owns the work) --------------------------
     def start_recording(self):
-        if self.recording:
+        if self.recorder.is_active:
             return
 
         path = self.entry_file.get_text().strip()
@@ -530,213 +863,69 @@ class RecorderWindow(Gtk.Window):
         self.entry_file.set_text(path)
         self.updating_toggle = False
 
-        directory = os.path.dirname(path)
-        if not os.path.isdir(directory):
-            self.fail("Cannot start recording", "Folder does not exist:\n" + directory)
-            return
-        if not os.access(directory, os.W_OK):
-            self.fail("Cannot start recording", "Folder is not writable:\n" + directory)
-            return
-
         device = self.entry_device.get_text().strip() or MONITOR
 
         try:
-            self.pipeline = build_pipeline(self.format_key, device, path)
-        except GLib.Error as error:
-            self.pipeline = None
-            self.fail(
-                "Could not build the GStreamer pipeline",
-                "{0}\n\nPipeline:\n{1}\n\n"
-                "A required plugin is probably missing - see the apt command "
-                "at the top of this script.".format(
-                    error.message, pipeline_description(self.format_key)
-                ),
+            self.recorder.start(
+                self.format_key, device, path, int(self.spin_limit.get_value())
             )
-            return
-        except RuntimeError as error:
-            self.pipeline = None
-            self.fail("Could not build the GStreamer pipeline", str(error))
-            return
-
-        self.bus = self.pipeline.get_bus()
-        self.bus.add_signal_watch()
-        self.bus.connect("message::error", self.on_bus_error)
-        self.bus.connect("message::warning", self.on_bus_warning)
-        self.bus.connect("message::eos", self.on_bus_eos)
-
-        change = self.pipeline.set_state(Gst.State.PLAYING)
-        if change == Gst.StateChangeReturn.FAILURE:
-            self.teardown_pipeline()
-            self.fail(
-                "Could not start recording",
-                "GStreamer refused to start the pipeline.\n\n"
-                "Check that the capture device exists:\n    {0}\n\n"
-                "List available monitors with:\n"
-                "    pactl list short sources | grep monitor".format(device),
-            )
-            return
-
-        self.recording = True
-        self.stopping = False
-        self.elapsed = 0
-        self.set_controls_sensitive(False)
-        self.set_toggle_state(True, "Stop Recording")
-        self.update_recording_status()
-        self.tick_id = GLib.timeout_add_seconds(1, self.on_tick)
-
-        limit = int(self.spin_limit.get_value())
-        if limit > 0:
-            self.duration_id = GLib.timeout_add_seconds(limit, self.on_duration_reached)
-
-    def on_tick(self):
-        if not self.recording:
-            self.tick_id = 0
-            return False
-        self.elapsed += 1
-        self.update_recording_status()
-        return True
-
-    def on_duration_reached(self):
-        self.duration_id = 0
-        if self.recording:
+        except RecorderError as error:
             self.set_toggle_state(False, "Start Recording")
-            self.stop_recording()
-        return False
-
-    def update_recording_status(self):
-        minutes, seconds = divmod(self.elapsed, 60)
-        hours, minutes = divmod(minutes, 60)
-        self.set_status(
-            "Recording → {0}  [{1:02d}:{2:02d}:{3:02d}]".format(
-                os.path.basename(self.entry_file.get_text()), hours, minutes, seconds
-            )
-        )
+            self.set_status("Idle - " + error.title.lower())
+            self.show_error(error.title, error.message)
 
     def stop_recording(self):
-        if not self.recording or self.stopping:
-            return
-        self.stopping = True
-        self.cancel_timer(self.duration_id)
-        self.duration_id = 0
-        self.cancel_timer(self.tick_id)
-        self.tick_id = 0
-        self.set_status("Finalising file...")
-        self.button_record.set_sensitive(False)
+        self.recorder.stop()
 
-        # Send EOS so wavenc/oggmux flush their headers and the file is valid.
-        self.pipeline.send_event(Gst.Event.new_eos())
-        self.eos_timeout_id = GLib.timeout_add(EOS_TIMEOUT_MS, self.on_eos_timeout)
+    # -- engine callbacks ---------------------------------------------------
+    def on_recorder_state(self, state):
+        if state == Recorder.RECORDING:
+            self.set_controls_sensitive(False)
+            self.set_toggle_state(True, "Stop Recording")
+            self.update_recording_status()
+        elif state == Recorder.STOPPING:
+            self.button_record.set_sensitive(False)
+            self.set_status("Finalising file...")
+        else:  # Recorder.IDLE
+            self.button_record.set_sensitive(True)
+            self.set_controls_sensitive(True)
+            self.set_toggle_state(False, "Start Recording")
+            # Next take gets a fresh timestamp if the user never picked a name.
+            if self.auto_filename:
+                self.updating_toggle = True
+                self.entry_file.set_text(
+                    default_filename(FORMATS[self.format_key]["ext"])
+                )
+                self.updating_toggle = False
 
-    def on_eos_timeout(self):
-        self.eos_timeout_id = 0
-        if self.stopping:
-            self.finish_recording(
-                "Idle - saved (forced) → "
-                + os.path.basename(self.entry_file.get_text())
-            )
-        return False
+    def on_recorder_tick(self, _elapsed):
+        self.update_recording_status()
 
-    def finish_recording(self, status_text):
-        path = self.entry_file.get_text()
-        self.teardown_pipeline()
-        self.recording = False
-        self.stopping = False
-        self.elapsed = 0
-        self.button_record.set_sensitive(True)
-        self.set_controls_sensitive(True)
-        self.set_toggle_state(False, "Start Recording")
-        # Next take gets a fresh timestamp if the user never picked a name.
-        if self.auto_filename:
-            self.updating_toggle = True
-            self.entry_file.set_text(default_filename(FORMATS[self.format_key]["ext"]))
-            self.updating_toggle = False
-        if status_text is None:
-            size = os.path.getsize(path) if os.path.exists(path) else 0
-            status_text = "Idle - saved {0} ({1:.1f} MiB)".format(
-                os.path.basename(path), size / (1024.0 * 1024.0)
-            )
-        self.set_status(status_text)
-
-    def fail(self, title, message):
-        """Report an error, drop any pipeline and return to the Idle state."""
-        self.cancel_timer(self.tick_id)
-        self.tick_id = 0
-        self.cancel_timer(self.duration_id)
-        self.duration_id = 0
-        self.cancel_timer(self.eos_timeout_id)
-        self.eos_timeout_id = 0
-        self.teardown_pipeline()
-        self.recording = False
-        self.stopping = False
-        self.button_record.set_sensitive(True)
-        self.set_controls_sensitive(True)
-        self.set_toggle_state(False, "Start Recording")
+    def on_recorder_error(self, title, message):
         self.set_status("Idle - " + title.lower())
         self.show_error(title, message)
 
-    @staticmethod
-    def cancel_timer(source_id):
-        if source_id:
-            GLib.source_remove(source_id)
+    def on_recorder_finished(self, path, size, forced):
+        name = os.path.basename(path or "")
+        if forced:
+            self.set_status("Idle - saved (forced) → " + name)
+        else:
+            self.set_status(
+                "Idle - saved {0} ({1:.1f} MiB)".format(name, size / (1024.0 * 1024.0))
+            )
 
-    def teardown_pipeline(self):
-        if self.bus is not None:
-            try:
-                self.bus.remove_signal_watch()
-            except Exception:
-                pass
-            self.bus = None
-        if self.pipeline is not None:
-            self.pipeline.set_state(Gst.State.NULL)
-            self.pipeline = None
-
-    # -- bus callbacks ------------------------------------------------------
-    # The bus watch dispatches on the main loop; the handlers below tear the
-    # watch itself down, so the real work is deferred to an idle callback.
-    def on_bus_eos(self, _bus, _message):
-        self.cancel_timer(self.eos_timeout_id)
-        self.eos_timeout_id = 0
-        if self.recording:
-            GLib.idle_add(self._deferred_eos)
-
-    def _deferred_eos(self):
-        if self.recording:
-            self.finish_recording(None)
-        return False
-
-    def on_bus_warning(self, _bus, message):
-        warning, _debug = message.parse_warning()
-        sys.stderr.write("[gst warning] {0}\n".format(warning.message))
-
-    def on_bus_error(self, _bus, message):
-        error, debug = message.parse_error()
-        details = error.message
-        if debug:
-            details += "\n\n" + debug
-        GLib.idle_add(self._deferred_error, details)
-
-    def _deferred_error(self, details):
-        if self.pipeline is not None:
-            self.fail("Recording error", details)
-        return False
+    def update_recording_status(self):
+        minutes, seconds = divmod(self.recorder.elapsed, 60)
+        hours, minutes = divmod(minutes, 60)
+        self.set_status(
+            "Recording → {0}  [{1:02d}:{2:02d}:{3:02d}]".format(
+                os.path.basename(self.recorder.path or ""), hours, minutes, seconds
+            )
+        )
 
     # -- shutdown -----------------------------------------------------------
     def shutdown(self):
-        self.cancel_timer(self.tick_id)
-        self.tick_id = 0
-        self.cancel_timer(self.duration_id)
-        self.duration_id = 0
-        self.cancel_timer(self.eos_timeout_id)
-        self.eos_timeout_id = 0
-        if self.pipeline is not None and self.recording:
-            # Flush the encoder/muxer so a file closed by window-close is playable.
-            self.pipeline.send_event(Gst.Event.new_eos())
-            bus = self.pipeline.get_bus()
-            bus.timed_pop_filtered(
-                2 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR
-            )
-        self.recording = False
-        self.teardown_pipeline()
+        self.recorder.shutdown()
 
 
 # -----------------------------------------------------------------------------
@@ -745,11 +934,10 @@ class RecorderWindow(Gtk.Window):
 def main():
     Gst.init(None)
 
-    missing = [
-        name
-        for name in ("pulsesrc", "audioconvert", "audioresample", "wavenc", "filesink")
-        if Gst.ElementFactory.find(name) is None
-    ]
+    required = [CAPTURE_ELEMENT, "audioconvert", "audioresample", "wavenc", "filesink"]
+    if WINDOWS:
+        required.append("audiorate")
+    missing = [name for name in required if Gst.ElementFactory.find(name) is None]
 
     window = RecorderWindow()
     window.show_all()
@@ -758,12 +946,8 @@ def main():
     if missing:
         window.show_error(
             "Missing GStreamer elements",
-            "The following elements are not installed: {0}\n\n"
-            "Install them with:\n"
-            "    sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0 \\\n"
-            "          gstreamer1.0-plugins-good gstreamer1.0-libav \\\n"
-            "          gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly".format(
-                ", ".join(missing)
+            "The following elements are not installed: {0}\n\n{1}".format(
+                ", ".join(missing), INSTALL_HINT
             ),
         )
     elif MONITOR_WARNING:
@@ -781,11 +965,9 @@ if __name__ == "__main__":
 # =============================================================================
 #  VERIFICATION CHECKLIST
 #  ---------------------------------------------------------------------------
-#  1. sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0 \
-#           gstreamer1.0-plugins-good gstreamer1.0-libav \
-#           gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly
+#  1. Install the dependencies for your platform (see the top of this file).
 #  2. python3 system_audio_recorder.py            -> small GTK window appears,
-#                                                    status reads "Idle".
+#     (Windows: python ...)                          status reads "Idle".
 #  3. Click "Browse..." -> pick a folder/name; the extension is forced to match
 #     the selected format (.wav or .opus). Switching the radio button rewrites
 #     the extension in the entry.
@@ -797,14 +979,30 @@ if __name__ == "__main__":
 #     Inspect it with:   gst-discoverer-1.0 <file>
 #
 #  Manual pipeline equivalents (handy for debugging outside the GUI):
+#
+#  LINUX:
 #    gst-launch-1.0 pulsesrc device=$MONITOR ! audioconvert ! audioresample \
 #        ! audio/x-raw,format=S16LE,rate=44100,channels=2 ! wavenc \
 #        ! filesink location=/tmp/test.wav
 #    gst-launch-1.0 pulsesrc device=$MONITOR ! audioconvert ! audioresample \
 #        ! opusenc bitrate=128000 ! oggmux ! filesink location=/tmp/test.opus
+#
+#  WINDOWS (no device= needed: loopback follows the default output):
+#    gst-launch-1.0 wasapi2src loopback=true ! audiorate ! audioconvert \
+#        ! audioresample ! audio/x-raw,format=S16LE,rate=44100,channels=2 \
+#        ! wavenc ! filesink location=test.wav
+#    gst-launch-1.0 wasapi2src loopback=true ! audiorate ! audioconvert \
+#        ! audioresample ! opusenc bitrate=128000 ! oggmux \
+#        ! filesink location=test.opus
+#
 #  (Press Ctrl+C once; add -e so gst-launch sends EOS and finalises the file.)
 #
-#  Troubleshooting silence: the device must be a *.monitor* source. Verify with
-#    pactl list short sources | grep monitor
-#  and paste the right name into the "Advanced -> Device" field.
+#  Troubleshooting silence:
+#    Linux   - the device must be a *.monitor* source. Verify with
+#              pactl list short sources | grep monitor
+#              and paste the right name into "Advanced -> Device".
+#    Windows - leave "Advanced -> Device" EMPTY to follow the default output.
+#              Note that players using WASAPI *exclusive* mode (some ASIO /
+#              audiophile players) bypass the shared mixer and cannot be
+#              captured by loopback at all.
 # =============================================================================
