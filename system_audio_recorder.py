@@ -366,6 +366,253 @@ def swap_extension(path, new_ext):
 
 
 # -----------------------------------------------------------------------------
+# Recording engine
+# -----------------------------------------------------------------------------
+class RecorderError(Exception):
+    """A start-up failure carrying a title and a human-readable explanation."""
+
+    def __init__(self, title, message):
+        Exception.__init__(self, "{0}: {1}".format(title, message))
+        self.title = title
+        self.message = message
+
+
+class Recorder(object):
+    """
+    The recording engine: pipeline lifecycle, state machine and timers.
+
+    Deliberately free of any GUI dependency -- it uses GLib (timers, main-loop
+    dispatch) but never Gtk, and it neither reads nor writes a widget.  A view
+    drives it through start()/stop() and learns about progress through the
+    callbacks handed to __init__, so the same engine can back a window, a test
+    harness or a headless caller.
+
+    State machine:  idle -> recording -> stopping -> idle
+
+    Callbacks (all optional):
+        on_state(state)                  state changed; see the constants below
+        on_tick(elapsed_seconds)         once a second while recording
+        on_error(title, message)         asynchronous failure; state is idle
+        on_finished(path, size, forced)  file closed; `forced` means the EOS
+                                         timed out and the pipeline was cut
+    """
+
+    IDLE = "idle"
+    RECORDING = "recording"
+    STOPPING = "stopping"
+
+    def __init__(self, on_state=None, on_tick=None, on_error=None, on_finished=None):
+        self._on_state = on_state or (lambda state: None)
+        self._on_tick = on_tick or (lambda elapsed: None)
+        self._on_error = on_error or (lambda title, message: None)
+        self._on_finished = on_finished or (lambda path, size, forced: None)
+
+        # Public, and the source of truth: no widget holds this state.
+        self.state = self.IDLE
+        self.path = None
+        self.format_key = None
+        self.device = None
+        self.elapsed = 0
+
+        self._pipeline = None
+        self._bus = None
+        self._tick_id = 0
+        self._duration_id = 0
+        self._eos_timeout_id = 0
+
+    @property
+    def is_active(self):
+        """True while recording or finalising."""
+        return self.state != self.IDLE
+
+    # -- control ------------------------------------------------------------
+    def start(self, fmt_key, device, path, limit_seconds=0):
+        """
+        Begin recording `fmt_key` from `device` into `path`.
+
+        `limit_seconds` > 0 stops automatically after that long.  Raises
+        RecorderError when recording cannot begin; the caller decides how to
+        present it.
+        """
+        if self.is_active:
+            return
+
+        directory = os.path.dirname(path)
+        if not os.path.isdir(directory):
+            raise RecorderError(
+                "Cannot start recording", "Folder does not exist:\n" + directory
+            )
+        if not os.access(directory, os.W_OK):
+            raise RecorderError(
+                "Cannot start recording", "Folder is not writable:\n" + directory
+            )
+
+        try:
+            self._pipeline = build_pipeline(fmt_key, device, path)
+        except GLib.Error as error:
+            self._pipeline = None
+            raise RecorderError(
+                "Could not build the GStreamer pipeline",
+                "{0}\n\nPipeline:\n{1}\n\n"
+                "A required plugin is probably missing.\n\n{2}".format(
+                    error.message, pipeline_description(fmt_key), INSTALL_HINT
+                ),
+            )
+        except RuntimeError as error:
+            self._pipeline = None
+            raise RecorderError("Could not build the GStreamer pipeline", str(error))
+
+        self._bus = self._pipeline.get_bus()
+        self._bus.add_signal_watch()
+        self._bus.connect("message::error", self._handle_bus_error)
+        self._bus.connect("message::warning", self._handle_bus_warning)
+        self._bus.connect("message::eos", self._handle_bus_eos)
+
+        if self._pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            self._teardown()
+            raise RecorderError(
+                "Could not start recording",
+                "GStreamer refused to start the pipeline.\n\n"
+                + (
+                    "Capture device: {0}\n\n".format(device)
+                    if device
+                    else "Capture device: (system default)\n\n"
+                )
+                + "List the available devices with:\n    " + DEVICE_LIST_HINT,
+            )
+
+        self.path = path
+        self.format_key = fmt_key
+        self.device = device
+        self.elapsed = 0
+        self._set_state(self.RECORDING)
+
+        self._tick_id = GLib.timeout_add_seconds(1, self._tick)
+        if limit_seconds > 0:
+            self._duration_id = GLib.timeout_add_seconds(
+                limit_seconds, self._duration_reached
+            )
+
+    def stop(self):
+        """
+        Ask for a clean stop.
+
+        EOS is sent so wavenc/oggmux flush their headers and the file is
+        valid; the state becomes "stopping" until that completes or times out.
+        """
+        if self.state != self.RECORDING:
+            return
+        self._cancel("_tick_id", "_duration_id")
+        self._set_state(self.STOPPING)
+        self._pipeline.send_event(Gst.Event.new_eos())
+        self._eos_timeout_id = GLib.timeout_add(EOS_TIMEOUT_MS, self._eos_timed_out)
+
+    def abort(self):
+        """Drop the pipeline and return to idle without finalising the file."""
+        self._cancel("_tick_id", "_duration_id", "_eos_timeout_id")
+        self._teardown()
+        self.elapsed = 0
+        self._set_state(self.IDLE)
+
+    def shutdown(self):
+        """
+        Best-effort synchronous finalisation, for application exit.
+
+        Unlike stop() this does not wait on the main loop -- which is about to
+        stop turning -- so it pumps the bus directly.  No callbacks are fired.
+        """
+        self._cancel("_tick_id", "_duration_id", "_eos_timeout_id")
+        if self._pipeline is not None and self.is_active:
+            # Flush the encoder/muxer so a file closed by window-close plays.
+            self._pipeline.send_event(Gst.Event.new_eos())
+            self._pipeline.get_bus().timed_pop_filtered(
+                2 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR
+            )
+        self.state = self.IDLE  # set directly: no observer left to notify
+        self._teardown()
+
+    # -- internals ----------------------------------------------------------
+    def _set_state(self, state):
+        self.state = state
+        self._on_state(state)
+
+    def _cancel(self, *names):
+        for name in names:
+            source_id = getattr(self, name)
+            if source_id:
+                GLib.source_remove(source_id)
+                setattr(self, name, 0)
+
+    def _teardown(self):
+        if self._bus is not None:
+            try:
+                self._bus.remove_signal_watch()
+            except Exception:
+                pass
+            self._bus = None
+        if self._pipeline is not None:
+            self._pipeline.set_state(Gst.State.NULL)
+            self._pipeline = None
+
+    def _finish(self, forced):
+        path = self.path
+        self._cancel("_tick_id", "_duration_id", "_eos_timeout_id")
+        self._teardown()
+        self.elapsed = 0
+        self._set_state(self.IDLE)
+        size = os.path.getsize(path) if path and os.path.exists(path) else 0
+        self._on_finished(path, size, forced)
+
+    def _tick(self):
+        if self.state != self.RECORDING:
+            self._tick_id = 0
+            return False
+        self.elapsed += 1
+        self._on_tick(self.elapsed)
+        return True
+
+    def _duration_reached(self):
+        self._duration_id = 0
+        self.stop()
+        return False
+
+    def _eos_timed_out(self):
+        self._eos_timeout_id = 0
+        if self.state == self.STOPPING:
+            self._finish(forced=True)
+        return False
+
+    # The bus watch dispatches on the main loop; these handlers tear the watch
+    # itself down, so the real work is deferred to an idle callback.
+    def _handle_bus_eos(self, _bus, _message):
+        self._cancel("_eos_timeout_id")
+        if self.is_active:
+            GLib.idle_add(self._deferred_finish)
+
+    def _deferred_finish(self):
+        if self.is_active:
+            self._finish(forced=False)
+        return False
+
+    def _handle_bus_warning(self, _bus, message):
+        warning, _debug = message.parse_warning()
+        sys.stderr.write("[gst warning] {0}\n".format(warning.message))
+
+    def _handle_bus_error(self, _bus, message):
+        error, debug = message.parse_error()
+        details = error.message
+        if debug:
+            details += "\n\n" + debug
+        GLib.idle_add(self._deferred_error, details)
+
+    def _deferred_error(self, details):
+        if self._pipeline is not None:
+            self.abort()
+            self._on_error("Recording error", details)
+        return False
+
+
+# -----------------------------------------------------------------------------
 # Main window
 # -----------------------------------------------------------------------------
 class RecorderWindow(Gtk.Window):
@@ -379,16 +626,15 @@ class RecorderWindow(Gtk.Window):
         self.set_resizable(True)
 
         # --- state -----------------------------------------------------------
-        self.pipeline = None
-        self.bus = None
-        self.recording = False
-        self.stopping = False
+        # Recording state lives in the engine; only view concerns are kept here.
         self.auto_filename = True          # filename still the generated default?
         self.updating_toggle = False       # guard against signal recursion
-        self.elapsed = 0
-        self.tick_id = 0
-        self.eos_timeout_id = 0
-        self.duration_id = 0
+        self.recorder = Recorder(
+            on_state=self.on_recorder_state,
+            on_tick=self.on_recorder_tick,
+            on_error=self.on_recorder_error,
+            on_finished=self.on_recorder_finished,
+        )
 
         # --- layout ----------------------------------------------------------
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -532,7 +778,7 @@ class RecorderWindow(Gtk.Window):
             self.auto_filename = False
 
     def on_format_toggled(self, button, key):
-        if not button.get_active() or self.recording:
+        if not button.get_active() or self.recorder.is_active:
             return
         ext = FORMATS[key]["ext"]
         current = self.entry_file.get_text().strip()
@@ -597,9 +843,9 @@ class RecorderWindow(Gtk.Window):
         Gtk.main_quit()
         return False
 
-    # -- recording ----------------------------------------------------------
+    # -- recording (thin: the engine owns the work) --------------------------
     def start_recording(self):
-        if self.recording:
+        if self.recorder.is_active:
             return
 
         path = self.entry_file.get_text().strip()
@@ -617,215 +863,69 @@ class RecorderWindow(Gtk.Window):
         self.entry_file.set_text(path)
         self.updating_toggle = False
 
-        directory = os.path.dirname(path)
-        if not os.path.isdir(directory):
-            self.fail("Cannot start recording", "Folder does not exist:\n" + directory)
-            return
-        if not os.access(directory, os.W_OK):
-            self.fail("Cannot start recording", "Folder is not writable:\n" + directory)
-            return
-
         device = self.entry_device.get_text().strip() or MONITOR
 
         try:
-            self.pipeline = build_pipeline(self.format_key, device, path)
-        except GLib.Error as error:
-            self.pipeline = None
-            self.fail(
-                "Could not build the GStreamer pipeline",
-                "{0}\n\nPipeline:\n{1}\n\n"
-                "A required plugin is probably missing.\n\n{2}".format(
-                    error.message, pipeline_description(self.format_key), INSTALL_HINT
-                ),
+            self.recorder.start(
+                self.format_key, device, path, int(self.spin_limit.get_value())
             )
-            return
-        except RuntimeError as error:
-            self.pipeline = None
-            self.fail("Could not build the GStreamer pipeline", str(error))
-            return
-
-        self.bus = self.pipeline.get_bus()
-        self.bus.add_signal_watch()
-        self.bus.connect("message::error", self.on_bus_error)
-        self.bus.connect("message::warning", self.on_bus_warning)
-        self.bus.connect("message::eos", self.on_bus_eos)
-
-        change = self.pipeline.set_state(Gst.State.PLAYING)
-        if change == Gst.StateChangeReturn.FAILURE:
-            self.teardown_pipeline()
-            self.fail(
-                "Could not start recording",
-                "GStreamer refused to start the pipeline.\n\n"
-                + (
-                    "Capture device: {0}\n\n".format(device)
-                    if device
-                    else "Capture device: (system default)\n\n"
-                )
-                + "List the available devices with:\n    " + DEVICE_LIST_HINT,
-            )
-            return
-
-        self.recording = True
-        self.stopping = False
-        self.elapsed = 0
-        self.set_controls_sensitive(False)
-        self.set_toggle_state(True, "Stop Recording")
-        self.update_recording_status()
-        self.tick_id = GLib.timeout_add_seconds(1, self.on_tick)
-
-        limit = int(self.spin_limit.get_value())
-        if limit > 0:
-            self.duration_id = GLib.timeout_add_seconds(limit, self.on_duration_reached)
-
-    def on_tick(self):
-        if not self.recording:
-            self.tick_id = 0
-            return False
-        self.elapsed += 1
-        self.update_recording_status()
-        return True
-
-    def on_duration_reached(self):
-        self.duration_id = 0
-        if self.recording:
+        except RecorderError as error:
             self.set_toggle_state(False, "Start Recording")
-            self.stop_recording()
-        return False
-
-    def update_recording_status(self):
-        minutes, seconds = divmod(self.elapsed, 60)
-        hours, minutes = divmod(minutes, 60)
-        self.set_status(
-            "Recording → {0}  [{1:02d}:{2:02d}:{3:02d}]".format(
-                os.path.basename(self.entry_file.get_text()), hours, minutes, seconds
-            )
-        )
+            self.set_status("Idle - " + error.title.lower())
+            self.show_error(error.title, error.message)
 
     def stop_recording(self):
-        if not self.recording or self.stopping:
-            return
-        self.stopping = True
-        self.cancel_timer(self.duration_id)
-        self.duration_id = 0
-        self.cancel_timer(self.tick_id)
-        self.tick_id = 0
-        self.set_status("Finalising file...")
-        self.button_record.set_sensitive(False)
+        self.recorder.stop()
 
-        # Send EOS so wavenc/oggmux flush their headers and the file is valid.
-        self.pipeline.send_event(Gst.Event.new_eos())
-        self.eos_timeout_id = GLib.timeout_add(EOS_TIMEOUT_MS, self.on_eos_timeout)
+    # -- engine callbacks ---------------------------------------------------
+    def on_recorder_state(self, state):
+        if state == Recorder.RECORDING:
+            self.set_controls_sensitive(False)
+            self.set_toggle_state(True, "Stop Recording")
+            self.update_recording_status()
+        elif state == Recorder.STOPPING:
+            self.button_record.set_sensitive(False)
+            self.set_status("Finalising file...")
+        else:  # Recorder.IDLE
+            self.button_record.set_sensitive(True)
+            self.set_controls_sensitive(True)
+            self.set_toggle_state(False, "Start Recording")
+            # Next take gets a fresh timestamp if the user never picked a name.
+            if self.auto_filename:
+                self.updating_toggle = True
+                self.entry_file.set_text(
+                    default_filename(FORMATS[self.format_key]["ext"])
+                )
+                self.updating_toggle = False
 
-    def on_eos_timeout(self):
-        self.eos_timeout_id = 0
-        if self.stopping:
-            self.finish_recording(
-                "Idle - saved (forced) → "
-                + os.path.basename(self.entry_file.get_text())
-            )
-        return False
+    def on_recorder_tick(self, _elapsed):
+        self.update_recording_status()
 
-    def finish_recording(self, status_text):
-        path = self.entry_file.get_text()
-        self.teardown_pipeline()
-        self.recording = False
-        self.stopping = False
-        self.elapsed = 0
-        self.button_record.set_sensitive(True)
-        self.set_controls_sensitive(True)
-        self.set_toggle_state(False, "Start Recording")
-        # Next take gets a fresh timestamp if the user never picked a name.
-        if self.auto_filename:
-            self.updating_toggle = True
-            self.entry_file.set_text(default_filename(FORMATS[self.format_key]["ext"]))
-            self.updating_toggle = False
-        if status_text is None:
-            size = os.path.getsize(path) if os.path.exists(path) else 0
-            status_text = "Idle - saved {0} ({1:.1f} MiB)".format(
-                os.path.basename(path), size / (1024.0 * 1024.0)
-            )
-        self.set_status(status_text)
-
-    def fail(self, title, message):
-        """Report an error, drop any pipeline and return to the Idle state."""
-        self.cancel_timer(self.tick_id)
-        self.tick_id = 0
-        self.cancel_timer(self.duration_id)
-        self.duration_id = 0
-        self.cancel_timer(self.eos_timeout_id)
-        self.eos_timeout_id = 0
-        self.teardown_pipeline()
-        self.recording = False
-        self.stopping = False
-        self.button_record.set_sensitive(True)
-        self.set_controls_sensitive(True)
-        self.set_toggle_state(False, "Start Recording")
+    def on_recorder_error(self, title, message):
         self.set_status("Idle - " + title.lower())
         self.show_error(title, message)
 
-    @staticmethod
-    def cancel_timer(source_id):
-        if source_id:
-            GLib.source_remove(source_id)
+    def on_recorder_finished(self, path, size, forced):
+        name = os.path.basename(path or "")
+        if forced:
+            self.set_status("Idle - saved (forced) → " + name)
+        else:
+            self.set_status(
+                "Idle - saved {0} ({1:.1f} MiB)".format(name, size / (1024.0 * 1024.0))
+            )
 
-    def teardown_pipeline(self):
-        if self.bus is not None:
-            try:
-                self.bus.remove_signal_watch()
-            except Exception:
-                pass
-            self.bus = None
-        if self.pipeline is not None:
-            self.pipeline.set_state(Gst.State.NULL)
-            self.pipeline = None
-
-    # -- bus callbacks ------------------------------------------------------
-    # The bus watch dispatches on the main loop; the handlers below tear the
-    # watch itself down, so the real work is deferred to an idle callback.
-    def on_bus_eos(self, _bus, _message):
-        self.cancel_timer(self.eos_timeout_id)
-        self.eos_timeout_id = 0
-        if self.recording:
-            GLib.idle_add(self._deferred_eos)
-
-    def _deferred_eos(self):
-        if self.recording:
-            self.finish_recording(None)
-        return False
-
-    def on_bus_warning(self, _bus, message):
-        warning, _debug = message.parse_warning()
-        sys.stderr.write("[gst warning] {0}\n".format(warning.message))
-
-    def on_bus_error(self, _bus, message):
-        error, debug = message.parse_error()
-        details = error.message
-        if debug:
-            details += "\n\n" + debug
-        GLib.idle_add(self._deferred_error, details)
-
-    def _deferred_error(self, details):
-        if self.pipeline is not None:
-            self.fail("Recording error", details)
-        return False
+    def update_recording_status(self):
+        minutes, seconds = divmod(self.recorder.elapsed, 60)
+        hours, minutes = divmod(minutes, 60)
+        self.set_status(
+            "Recording → {0}  [{1:02d}:{2:02d}:{3:02d}]".format(
+                os.path.basename(self.recorder.path or ""), hours, minutes, seconds
+            )
+        )
 
     # -- shutdown -----------------------------------------------------------
     def shutdown(self):
-        self.cancel_timer(self.tick_id)
-        self.tick_id = 0
-        self.cancel_timer(self.duration_id)
-        self.duration_id = 0
-        self.cancel_timer(self.eos_timeout_id)
-        self.eos_timeout_id = 0
-        if self.pipeline is not None and self.recording:
-            # Flush the encoder/muxer so a file closed by window-close is playable.
-            self.pipeline.send_event(Gst.Event.new_eos())
-            bus = self.pipeline.get_bus()
-            bus.timed_pop_filtered(
-                2 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR
-            )
-        self.recording = False
-        self.teardown_pipeline()
+        self.recorder.shutdown()
 
 
 # -----------------------------------------------------------------------------

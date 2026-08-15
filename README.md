@@ -83,18 +83,44 @@ a bug in this app.
 re-run the install command for your platform. Element origins are documented
 at the top of the script.
 
+## Architecture
+
+The file is one script but two layers, and the split is the load-bearing part
+of the design:
+
+- **`Recorder`** — the engine. Owns the GStreamer pipeline, the
+  `idle → recording → stopping → idle` state machine, and all the timers. It
+  uses GLib but never Gtk, holds its own path/format/elapsed as real
+  attributes, and reports progress through four callbacks (`on_state`,
+  `on_tick`, `on_error`, `on_finished`). It can be driven with no GUI at all.
+- **`RecorderWindow`** — the view. Builds widgets, resolves the output path
+  and format from them, calls `recorder.start()` / `recorder.stop()`, and
+  renders the callbacks into the status label and button states.
+
+Because the engine has no widget dependency, a second front-end (a CLI, a tray
+icon, a web UI) can reuse it whole rather than re-implementing the delicate
+part — EOS finalisation, timeout guards, teardown ordering.
+
 ## Verifying it works
 
-`ref_docs/verify_recorder.py` is a headless end-to-end check: it plays a test
-tone while recording the loopback through the app's own pipeline code, then
-asserts both output files decode and actually contain the tone.
+Two headless harnesses, both exit 0 on success:
 
 ```bash
 python3 ref_docs/verify_recorder.py
 ```
 
-Exit code 0 means PASS. Add `--keep` to leave the recordings on disk for a
-listen, or `--seconds N` to record longer.
+End-to-end audio check: plays a test tone while recording the loopback through
+the app's own pipeline code, then asserts both files decode and actually
+contain the tone. Add `--keep` to keep the recordings, `--seconds N` to record
+longer.
+
+```bash
+python3 ref_docs/verify_engine.py
+```
+
+Engine test suite: drives `Recorder` directly with no window — full cycle with
+auto-stop, manual stop, callback ordering, error paths, mid-recording shutdown,
+and the re-entrancy guard.
 
 A fuller manual checklist (including `gst-launch-1.0` equivalents of both
 pipelines, per platform, for debugging outside the GUI) is at the bottom of
