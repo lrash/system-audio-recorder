@@ -1,6 +1,36 @@
 # Windows Port Plan — System Audio Recorder
 
-*Drafted 2026-08-15. Status: proposed, not started.*
+*Drafted 2026-08-15. Updated 2026-08-15 after implementation.*
+
+## Status
+
+| Phase | State |
+|---|---|
+| 1 — Platform abstraction refactor | **DONE**, Linux regression gate PASSED |
+| 2 — Windows capture specifics | **DONE** (device tooltip/placeholder, pythonw note) |
+| 3 — Install & run documentation | **DONE** (README) |
+| 4 — Windows verification on hardware | **BLOCKED — needs a real Windows machine** |
+| 5 — Packaging | not started (optional) |
+
+What could be proven on Linux has been:
+
+- Linux pipeline strings are **byte-identical** to the pre-refactor versions.
+- Linux end-to-end gate (tone → record → decode + peak check) **PASS**.
+- GUI smoke test (build window, toggle formats, rewrite extensions) **OK**.
+- Windows branch resolved by forcing `sys.platform` — correct source element,
+  empty device, no subprocess calls, `%USERPROFILE%` honoured.
+- Windows **encode chain** (`audiorate ! audioconvert ! … ! wavenc/opusenc`)
+  run for real with a stand-in source: both files decode.
+
+The one thing Linux cannot prove is `wasapi2src` itself. That is Phase 4.
+
+### Deviation from the original plan
+
+`low-latency=true` was **not** set on `wasapi2src`. For a recorder, glitch-free
+capture beats a snappier stop, and EOS finalisation already bounds stop time.
+`audiorate` **was** added to the Windows chain up front (rather than held as a
+fallback) because it is an inert passthrough when the source behaves and fixes
+risk 1 when it does not — cheap insurance, verified harmless.
 
 ## Goal
 
@@ -87,22 +117,59 @@ Run from the UCRT64 shell: `python system_audio_recorder.py`.
 
 ### Phase 4 — Windows verification (on real hardware, non-negotiable)
 
-Port `verify_recorder.py` (in this folder as `../` scratch history; recreate
-as `ref_docs/verify_recorder_windows.py`): play a 440 Hz tone via
-`audiotestsrc ! wasapi2sink` while recording `wasapi2src loopback=true`
-through the app's own `build_pipeline()`, assert duration ≥ 2.5 s and peak
-amplitude, discover-check the Opus file. Deliver as copy-paste commands for
-the Windows machine. **A Linux run is never Windows verification.**
+`ref_docs/verify_recorder.py` is already cross-platform: it picks
+`wasapi2sink` for tone playback on Windows and drives the app's own
+`build_pipeline()`, so it exercises the real Windows chain, not a copy.
+**A Linux run is never Windows verification.**
 
-Manual test matrix on the Windows box:
+#### Copy-paste for the Windows machine
+
+Install MSYS2 from https://www.msys2.org/, then in the **UCRT64** shell:
+
+```bash
+pacman -S --needed git mingw-w64-ucrt-x86_64-python mingw-w64-ucrt-x86_64-python-gobject mingw-w64-ucrt-x86_64-gtk3 mingw-w64-ucrt-x86_64-gstreamer mingw-w64-ucrt-x86_64-gst-plugins-base mingw-w64-ucrt-x86_64-gst-plugins-good mingw-w64-ucrt-x86_64-gst-plugins-bad
+```
+
+```bash
+git clone https://github.com/lrash/system-audio-recorder.git && cd system-audio-recorder && git checkout windows-port
+```
+
+Confirm the loopback element exists and the plugin version is new enough:
+
+```bash
+gst-inspect-1.0 wasapi2src | head -20
+```
+
+Start some audio playing, then run the automated gate:
+
+```bash
+python ref_docs/verify_recorder.py --seconds 6 --keep
+```
+
+Expect `RESULT   : PASS`, a WAV peak well above 500, and both durations ≈ 6 s.
+A PASS with a near-zero peak means loopback captured silence — check that
+audio was actually playing to the *default* output device.
+
+Then the GUI:
+
+```bash
+python system_audio_recorder.py
+```
+
+#### Manual test matrix on the Windows box
 
 - [ ] Default device capture (speakers) — WAV and Opus
-- [ ] Capture while default output is a USB/BT headset
-- [ ] Recording spans a silence gap (see risk 1)
+- [ ] Capture while default output is a USB/Bluetooth headset
+- [ ] Switch the default output device *while idle*, record again — follows it
+- [ ] Recording spans a silence gap (see risk 1) — duration must match
+      wall-clock, not just the audible portion
 - [ ] Stop via button, auto-stop timer, and window-close mid-recording —
       file plays in all three cases
-- [ ] Save path with spaces + OneDrive-synced folder
-- [ ] Device override via Advanced field
+- [ ] Save path with spaces, and a OneDrive-synced folder
+- [ ] Default filename lands in the **Windows profile** (`C:\Users\<name>`),
+      not the MSYS2 home — this is the `home_directory()` fix
+- [ ] Device override via Advanced field (id from
+      `gst-device-monitor-1.0 Audio/Sink`)
 
 ### Phase 5 (optional, later) — Packaging
 

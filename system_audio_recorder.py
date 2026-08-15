@@ -4,16 +4,22 @@
 # =============================================================================
 #  System Audio Recorder
 #  ---------------------------------------------------------------------------
-#  Records what you HEAR (the system audio output / loopback "monitor" source)
-#  on Ubuntu 20.04+ running either PulseAudio or PipeWire (pipewire-pulse).
+#  Records what you HEAR (the system audio output loopback) on:
+#    * Linux   - Ubuntu 20.04+ with PulseAudio or PipeWire (pipewire-pulse)
+#    * Windows - Windows 10/11 via WASAPI loopback
 #
 #  Pure GStreamer + PyGObject.  No FFmpeg, no subprocess recording.
-#  `pactl` is used ONCE at startup, only to discover the monitor device name;
-#  on PipeWire boxes without pulseaudio-utils, `pw-dump` is used instead.
+#
+#  On Linux the capture device must be named explicitly, so `pactl` is run ONCE
+#  at startup to discover the monitor source (falling back to `pw-dump` on
+#  PipeWire boxes without pulseaudio-utils).  On Windows `wasapi2src` captures
+#  the default render device on its own, so no discovery step is needed.
 #
 #  ---------------------------------------------------------------------------
 #  HOW TO INSTALL DEPENDENCIES  (run this once, before first launch)
 #  ---------------------------------------------------------------------------
+#
+#  LINUX (Debian/Ubuntu):
 #
 #    sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0 \
 #          gstreamer1.0-plugins-good gstreamer1.0-libav \
@@ -24,13 +30,25 @@
 #    sudo apt install gir1.2-gstreamer-1.0 gstreamer1.0-pulseaudio \
 #          gstreamer1.0-plugins-base pulseaudio-utils
 #
-#  Then run:
+#  Then run:   python3 system_audio_recorder.py
 #
-#    python3 system_audio_recorder.py
+#  WINDOWS (MSYS2 - https://www.msys2.org/), from the UCRT64 shell:
+#
+#    pacman -S --needed mingw-w64-ucrt-x86_64-python \
+#          mingw-w64-ucrt-x86_64-python-gobject \
+#          mingw-w64-ucrt-x86_64-gtk3 \
+#          mingw-w64-ucrt-x86_64-gstreamer \
+#          mingw-w64-ucrt-x86_64-gst-plugins-base \
+#          mingw-w64-ucrt-x86_64-gst-plugins-good \
+#          mingw-w64-ucrt-x86_64-gst-plugins-bad
+#
+#    Then run:   python system_audio_recorder.py
+#    (or `pythonw system_audio_recorder.py` for no console window)
 #
 #  ---------------------------------------------------------------------------
 #  Element origins (for troubleshooting "no element ..." errors):
 #    pulsesrc, wavenc      -> gstreamer1.0-pulseaudio / -plugins-good
+#    wasapi2src (Windows)  -> gst-plugins-bad (GStreamer >= 1.18)
 #    audioconvert, resample-> gstreamer1.0-plugins-base
 #    opusenc               -> gstreamer1.0-plugins-base (>=1.14) or -plugins-bad
 #    oggmux                -> gstreamer1.0-plugins-base
@@ -53,33 +71,63 @@ from gi.repository import GLib, Gst, Gtk, Pango  # noqa: E402  (after require_ve
 
 APP_TITLE = "System Audio Recorder"
 
-# Last-resort device name if `pactl` is unavailable or reports no monitor.
+WINDOWS = sys.platform == "win32"
+
+# Last-resort Linux device name if `pactl`/`pw-dump` report no monitor.
+# Unused on Windows, where the source finds the default render device itself.
 FALLBACK_MONITOR = "alsa_output.pci-0000_00_1f.3.analog-stereo.monitor"
 
-# Formats: key -> (label, file extension, GStreamer pipeline description)
+if WINDOWS:
+    # wasapi2src with loopback=true captures the default *render* endpoint --
+    # i.e. what you hear -- with no device name required.
+    #
+    # `audiorate` is deliberate insurance: WASAPI loopback historically stops
+    # delivering buffers while nothing is playing, which would shorten the
+    # recording rather than record silence.  audiorate fills such gaps to keep
+    # wall-clock and media time in step, and is an inert passthrough when the
+    # source already behaves (which wasapi2src does on current Windows 10/11).
+    SOURCE_DESCRIPTION = "wasapi2src name=src loopback=true ! audiorate"
+    CAPTURE_ELEMENT = "wasapi2src"
+    DEVICE_LIST_HINT = "gst-device-monitor-1.0 Audio/Sink"
+    INSTALL_HINT = (
+        "Install them from the MSYS2 UCRT64 shell with:\n"
+        "    pacman -S --needed mingw-w64-ucrt-x86_64-gstreamer \\\n"
+        "          mingw-w64-ucrt-x86_64-gst-plugins-base \\\n"
+        "          mingw-w64-ucrt-x86_64-gst-plugins-good \\\n"
+        "          mingw-w64-ucrt-x86_64-gst-plugins-bad"
+    )
+else:
+    SOURCE_DESCRIPTION = "pulsesrc name=src"
+    CAPTURE_ELEMENT = "pulsesrc"
+    DEVICE_LIST_HINT = "pactl list short sources | grep monitor"
+    INSTALL_HINT = (
+        "Install them with:\n"
+        "    sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0 \\\n"
+        "          gstreamer1.0-plugins-good gstreamer1.0-libav \\\n"
+        "          gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly"
+    )
+
+# Formats: key -> (label, file extension, encode/mux tail of the pipeline).
+# The capture source is prepended per platform by pipeline_description().
 FORMATS = {
     "wav": {
         "label": "WAV",
         "ext": ".wav",
         "mime_pattern": "*.wav",
-        "description": (
-            "pulsesrc name=src ! "
+        "encoder": (
             "audioconvert ! audioresample ! "
             "audio/x-raw,format=S16LE,rate=44100,channels=2 ! "
-            "wavenc ! "
-            "filesink name=sink"
+            "wavenc"
         ),
     },
     "opus": {
         "label": "Opus",
         "ext": ".opus",
         "mime_pattern": "*.opus",
-        "description": (
-            "pulsesrc name=src ! "
+        "encoder": (
             "audioconvert ! audioresample ! "
             "opusenc bitrate=128000 ! "
-            "oggmux ! "
-            "filesink name=sink"
+            "oggmux"
         ),
     },
 }
@@ -189,15 +237,23 @@ def _pw_default_sink_name(dump):
 
 def detect_monitor():
     """
-    Detect the monitor source of the default output device.
+    Detect the loopback capture device for the default output.
 
-    Tries `pactl` first (PulseAudio, or PipeWire via pipewire-pulse), then
-    falls back to `pw-dump` on PipeWire boxes without pulseaudio-utils —
-    pipewire-pulse exposes each sink's monitor as "<node.name>.monitor".
+    On Windows there is nothing to detect: wasapi2src with loopback=true
+    already follows the default render endpoint, so ("", None) is returned and
+    the source is left on its own default.
+
+    On Linux the device must be named, so this tries `pactl` first (PulseAudio,
+    or PipeWire via pipewire-pulse), then falls back to `pw-dump` on PipeWire
+    boxes without pulseaudio-utils — pipewire-pulse exposes each sink's monitor
+    as "<node.name>.monitor".
 
     Returns (device_name, warning_or_None).  The warning is a human-readable
     string when detection was not reliable and the user should double-check.
     """
+    if WINDOWS:
+        return "", None
+
     monitors = list_monitor_sources()
     sink = default_sink_name()
 
@@ -237,7 +293,9 @@ MONITOR, MONITOR_WARNING = detect_monitor()
 # -----------------------------------------------------------------------------
 def pipeline_description(fmt_key):
     """Return the gst-launch style description for the given format key."""
-    return FORMATS[fmt_key]["description"]
+    return "{0} ! {1} ! filesink name=sink".format(
+        SOURCE_DESCRIPTION, FORMATS[fmt_key]["encoder"]
+    )
 
 
 def build_pipeline(fmt_key, device, location):
@@ -247,6 +305,10 @@ def build_pipeline(fmt_key, device, location):
     The element chain is parsed from the description above; `device` and
     `location` are applied as properties afterwards so that names containing
     spaces, quotes or other shell-significant characters are handled safely.
+
+    `device` may be None or empty, which leaves the source on its own default.
+    That is the normal case on Windows (wasapi2src follows the default render
+    endpoint) and the last-resort case on Linux.
 
     Raises GLib.Error if the description cannot be parsed (missing plugin, ...)
     or RuntimeError if the named elements are unexpectedly absent.
@@ -258,13 +320,15 @@ def build_pipeline(fmt_key, device, location):
     if src is None or sink is None:
         raise RuntimeError("Internal error: pipeline is missing 'src' or 'sink'.")
 
-    src.set_property("device", device)
-    # Keep the ring buffer modest so stopping is snappy.
-    try:
-        src.set_property("buffer-time", 200000)   # 200 ms
-        src.set_property("latency-time", 20000)   # 20 ms
-    except TypeError:
-        pass  # Older pulsesrc without these properties: harmless.
+    if device:
+        src.set_property("device", device)
+    # Keep the ring buffer modest so stopping is snappy.  Both properties are
+    # pulsesrc-specific; wasapi2src manages its own buffering.
+    for prop, value in (("buffer-time", 200000), ("latency-time", 20000)):
+        try:
+            src.set_property(prop, value)
+        except TypeError:
+            pass  # Source without these properties (wasapi2src, older pulsesrc).
 
     sink.set_property("location", location)
     sink.set_property("sync", False)
@@ -272,10 +336,25 @@ def build_pipeline(fmt_key, device, location):
     return pipeline
 
 
+def home_directory():
+    """
+    The user's home folder.
+
+    On Windows under MSYS2, os.path.expanduser("~") resolves to the MSYS2 home
+    (C:\\msys64\\home\\<user>) rather than the Windows profile, which is not
+    where anyone expects their recordings.  Prefer USERPROFILE there.
+    """
+    if WINDOWS:
+        profile = os.environ.get("USERPROFILE")
+        if profile and os.path.isdir(profile):
+            return profile
+    return os.path.expanduser("~")
+
+
 def default_filename(ext):
-    """~/sysrec-YYYYMMDD-HHMMSS.<ext>"""
+    """<home>/sysrec-YYYYMMDD-HHMMSS.<ext>"""
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    return os.path.join(os.path.expanduser("~"), "sysrec-{0}{1}".format(stamp, ext))
+    return os.path.join(home_directory(), "sysrec-{0}{1}".format(stamp, ext))
 
 
 def swap_extension(path, new_ext):
@@ -357,10 +436,18 @@ class RecorderWindow(Gtk.Window):
         row_device.pack_start(Gtk.Label(label="Device:"), False, False, 0)
         self.entry_device = Gtk.Entry()
         self.entry_device.set_text(MONITOR)
-        self.entry_device.set_tooltip_text(
-            "PulseAudio/PipeWire monitor source.\n"
-            "List them with:  pactl list short sources | grep monitor"
-        )
+        if WINDOWS:
+            self.entry_device.set_placeholder_text("(default output device)")
+            self.entry_device.set_tooltip_text(
+                "Leave empty to follow the default output device.\n"
+                "To capture a specific one, paste its WASAPI device id.\n"
+                "List them with:  gst-device-monitor-1.0 Audio/Sink"
+            )
+        else:
+            self.entry_device.set_tooltip_text(
+                "PulseAudio/PipeWire monitor source.\n"
+                "List them with:  pactl list short sources | grep monitor"
+            )
         row_device.pack_start(self.entry_device, True, True, 0)
         adv.pack_start(row_device, False, False, 0)
 
@@ -547,9 +634,8 @@ class RecorderWindow(Gtk.Window):
             self.fail(
                 "Could not build the GStreamer pipeline",
                 "{0}\n\nPipeline:\n{1}\n\n"
-                "A required plugin is probably missing - see the apt command "
-                "at the top of this script.".format(
-                    error.message, pipeline_description(self.format_key)
+                "A required plugin is probably missing.\n\n{2}".format(
+                    error.message, pipeline_description(self.format_key), INSTALL_HINT
                 ),
             )
             return
@@ -570,9 +656,12 @@ class RecorderWindow(Gtk.Window):
             self.fail(
                 "Could not start recording",
                 "GStreamer refused to start the pipeline.\n\n"
-                "Check that the capture device exists:\n    {0}\n\n"
-                "List available monitors with:\n"
-                "    pactl list short sources | grep monitor".format(device),
+                + (
+                    "Capture device: {0}\n\n".format(device)
+                    if device
+                    else "Capture device: (system default)\n\n"
+                )
+                + "List the available devices with:\n    " + DEVICE_LIST_HINT,
             )
             return
 
@@ -745,11 +834,10 @@ class RecorderWindow(Gtk.Window):
 def main():
     Gst.init(None)
 
-    missing = [
-        name
-        for name in ("pulsesrc", "audioconvert", "audioresample", "wavenc", "filesink")
-        if Gst.ElementFactory.find(name) is None
-    ]
+    required = [CAPTURE_ELEMENT, "audioconvert", "audioresample", "wavenc", "filesink"]
+    if WINDOWS:
+        required.append("audiorate")
+    missing = [name for name in required if Gst.ElementFactory.find(name) is None]
 
     window = RecorderWindow()
     window.show_all()
@@ -758,12 +846,8 @@ def main():
     if missing:
         window.show_error(
             "Missing GStreamer elements",
-            "The following elements are not installed: {0}\n\n"
-            "Install them with:\n"
-            "    sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0 \\\n"
-            "          gstreamer1.0-plugins-good gstreamer1.0-libav \\\n"
-            "          gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly".format(
-                ", ".join(missing)
+            "The following elements are not installed: {0}\n\n{1}".format(
+                ", ".join(missing), INSTALL_HINT
             ),
         )
     elif MONITOR_WARNING:
@@ -781,11 +865,9 @@ if __name__ == "__main__":
 # =============================================================================
 #  VERIFICATION CHECKLIST
 #  ---------------------------------------------------------------------------
-#  1. sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0 \
-#           gstreamer1.0-plugins-good gstreamer1.0-libav \
-#           gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly
+#  1. Install the dependencies for your platform (see the top of this file).
 #  2. python3 system_audio_recorder.py            -> small GTK window appears,
-#                                                    status reads "Idle".
+#     (Windows: python ...)                          status reads "Idle".
 #  3. Click "Browse..." -> pick a folder/name; the extension is forced to match
 #     the selected format (.wav or .opus). Switching the radio button rewrites
 #     the extension in the entry.
@@ -797,14 +879,30 @@ if __name__ == "__main__":
 #     Inspect it with:   gst-discoverer-1.0 <file>
 #
 #  Manual pipeline equivalents (handy for debugging outside the GUI):
+#
+#  LINUX:
 #    gst-launch-1.0 pulsesrc device=$MONITOR ! audioconvert ! audioresample \
 #        ! audio/x-raw,format=S16LE,rate=44100,channels=2 ! wavenc \
 #        ! filesink location=/tmp/test.wav
 #    gst-launch-1.0 pulsesrc device=$MONITOR ! audioconvert ! audioresample \
 #        ! opusenc bitrate=128000 ! oggmux ! filesink location=/tmp/test.opus
+#
+#  WINDOWS (no device= needed: loopback follows the default output):
+#    gst-launch-1.0 wasapi2src loopback=true ! audiorate ! audioconvert \
+#        ! audioresample ! audio/x-raw,format=S16LE,rate=44100,channels=2 \
+#        ! wavenc ! filesink location=test.wav
+#    gst-launch-1.0 wasapi2src loopback=true ! audiorate ! audioconvert \
+#        ! audioresample ! opusenc bitrate=128000 ! oggmux \
+#        ! filesink location=test.opus
+#
 #  (Press Ctrl+C once; add -e so gst-launch sends EOS and finalises the file.)
 #
-#  Troubleshooting silence: the device must be a *.monitor* source. Verify with
-#    pactl list short sources | grep monitor
-#  and paste the right name into the "Advanced -> Device" field.
+#  Troubleshooting silence:
+#    Linux   - the device must be a *.monitor* source. Verify with
+#              pactl list short sources | grep monitor
+#              and paste the right name into "Advanced -> Device".
+#    Windows - leave "Advanced -> Device" EMPTY to follow the default output.
+#              Note that players using WASAPI *exclusive* mode (some ASIO /
+#              audiophile players) bypass the shared mixer and cannot be
+#              captured by loopback at all.
 # =============================================================================
